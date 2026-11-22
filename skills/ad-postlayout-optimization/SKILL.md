@@ -12,6 +12,8 @@ exporting, solving, waiting, or applying its plan.
 Read the job's `.ai-handoff.json` before inspecting the live PCB. Its groups
 are `rigid_first`: preserve member offsets and rotation by default. Treat
 locked members, centers, and user-designated structural parts as immutable.
+Also read `ClassPlacerRules.json` beside the PCB. Do not violate a `hard`
+pin-proximity rule during any local adjustment.
 
 First perform a read-only AD preflight: board outline, keepouts, locked parts,
 connectors, component collisions, critical nets, and existing routing. Then

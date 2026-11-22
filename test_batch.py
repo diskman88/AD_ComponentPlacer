@@ -7,7 +7,8 @@ import threading
 import time
 import unittest
 
-from batch import ai_handoff_specs,load,center_options,center_indices,class_info,initial_radius,room_specs,select_classes,target_layers,plan_batch,validate_batch,publish
+from batch import ai_handoff_specs,load,center_options,center_indices,class_info,initial_radius,proximity_for_subset,room_specs,select_classes,target_layers,plan_batch,validate_batch,publish
+from electrical_rules import load_rules
 from solver import Cancelled,align_without_regression,box_at,intersect,legal,score,solve,validate,wire_scores
 from class_desktop import work
 from install import install
@@ -228,6 +229,23 @@ class BatchTests(unittest.TestCase):
         c1=next(member for member in handoff['groups'][0]['members'] if member['designator']=='C1')
         self.assertEqual((c1['dx'],c1['dy']),(200.,100.))
         self.assertIn('APPLIED',handoff['invariant'])
+
+    def test_hard_pin_proximity_rejects_distant_capacitor(self):
+        d=fixture();ids=[0,1];mapping={0:0,1:1};poses=[p['pose'] for p in d['parts']]
+        rules=[dict(source='C1',target='U1',source_net='A',target_net='A',required_source_net='',max_distance=100.,weight=10.,severity='hard')]
+        compiled=proximity_for_subset(d,ids,mapping,poses,[0],rules)
+        subset=dict(parts=copy.deepcopy(d['parts'][:2]),anchor=0,anchors=[0],gap=12.,radius=1000.,obstacles=[],pads=d['pads'][:2],proximity_rules=compiled)
+        subset['parts'][0]['fixed']=True
+        self.assertFalse(legal(subset,[poses[0],(1200.,1000.,0.)],1,(1200.,1000.,0.)))
+        self.assertTrue(legal(subset,[poses[0],(1080.,1000.,0.)],1,(1080.,1000.,0.)))
+
+    def test_rule_file_normalizes_decoupling_and_proximity(self):
+        d=fixture()
+        with tempfile.TemporaryDirectory() as td:
+            board=Path(td)/'test.PcbDoc';d['board']=str(board)
+            Path(td,'ClassPlacerRules.json').write_text(json.dumps(dict(schema='ad-component-placer-rules/v1',pin_proximity=[dict(source='C1',target='U1',source_net='A',target_net='A',severity='hard')],decoupling=[dict(capacitor='C1',ic='U1',power_net='A',ground_net='')])) ,encoding='utf-8')
+            rules=load_rules(d['board'])
+        self.assertEqual([rule['kind'] for rule in rules],['pin_proximity','decoupling'])
 
     def test_locked_center_is_room_free_but_still_avoids_obstacles(self):
         d=fixture();d['parts'][0]['fixed']=True

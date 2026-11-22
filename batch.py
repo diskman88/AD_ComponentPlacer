@@ -4,7 +4,8 @@ import json
 import math
 from pathlib import Path
 import time
-from solver import Cancelled, box_at, intersect, number, solve, validate, score
+from solver import Cancelled, box_at, intersect, number, rotate, solve, validate, score
+from electrical_rules import load_rules
 
 
 def read_lines(path):
@@ -104,6 +105,33 @@ def initial_radius(parts, gap):
     largest = max([max(p['box'][2]-p['box'][0],p['box'][3]-p['box'][1])
                    for p in parts if not p['fixed']] or [0])
     return max(100., math.sqrt(area/.55)/2+largest/2+gap)
+
+
+def proximity_for_subset(data, ids, mapping, poses, anchors, rules):
+    """Compile named electrical rules to local solver geometry for one Class."""
+    by_name = {part['name'].strip().upper(): i for i,part in enumerate(data['parts'])}
+    compiled = []
+    for rule in rules:
+        source = by_name.get(rule['source'].upper()); target = by_name.get(rule['target'].upper())
+        if source is None or target is None:
+            raise ValueError('Electrical rule references missing component: '+rule['source']+' / '+rule['target'])
+        if source not in mapping:
+            continue
+        if target not in anchors and not data['parts'][target]['fixed']:
+            raise ValueError('Electrical-rule target must be a selected center or locked: '+rule['target'])
+        source_pads = [(x,y) for owner,pad_net,x,y in data['pads'] if owner == source and pad_net.upper() == rule['source_net'].upper()]
+        target_pads = [(x,y) for owner,pad_net,x,y in data['pads'] if owner == target and pad_net.upper() == rule['target_net'].upper()]
+        if not source_pads or not target_pads:
+            raise ValueError('Electrical rule net missing on source or target: '+rule['source']+' / '+rule['target'])
+        if rule['required_source_net'] and not any(owner == source and pad_net.upper() == rule['required_source_net'].upper() for owner,pad_net,x,y in data['pads']):
+            raise ValueError('Required second net missing on source: '+rule['source'])
+        target_pose, target_part = poses[target], data['parts'][target]
+        targets = []
+        for x,y in target_pads:
+            dx,dy = rotate(x,y,target_pose[2]-target_part['pose'][2]); targets.append((target_pose[0]+dx,target_pose[1]+dy))
+        compiled.append(dict(source=mapping[source],source_pads=source_pads,targets=targets,
+                             max_distance=rule['max_distance'],weight=rule['weight'],severity=rule['severity']))
+    return compiled
 
 
 def _selection(data, indices, centers=None, sides=None):
@@ -212,6 +240,7 @@ def ai_handoff_specs(data, indices, poses, gap, centers=None, sides=None):
                                        top=max(box[3] for box in boxes)+gap)))
     return dict(schema='ad-component-placer-ai-handoff/v1',board=data['board'],project=data['project'],
                 stage='prelayout_complete_wait_for_ad_apply',groups=groups,
+                electrical_rules='Read ClassPlacerRules.json beside the PCB before any local AI adjustment.',
                 invariant='Do not run AI/EDA edits until the corresponding .adstatus starts with APPLIED.')
 
 
@@ -222,6 +251,7 @@ def plan_batch(data, indices, gap, per_class, cancel, progress=lambda *args: Non
     _, all_anchors, choices = _selection(data,indices,centers,sides)
     selected = {ci:(anchors_for_class,side) for ci,anchors_for_class,side in choices}
     final_layers = target_layers(data,indices,centers,sides)
+    rules = load_rules(data['board'])
     poses = [p['pose'] for p in data['parts']]; reports = []
     for order, ci in enumerate(indices):
         if cancel.is_set(): raise Cancelled()
@@ -238,7 +268,8 @@ def plan_batch(data, indices, gap, per_class, cancel, progress=lambda *args: Non
                       anchors=[mapping[i] for i in anchors_for_class],gap=gap,pads=pads,obstacles=obstacles,
                       # A locked center is a user-established anchor, so this
                       # class follows it without a Room/search-boundary limit.
-                      unbounded=follow_locked_center)
+                      unbounded=follow_locked_center,
+                      proximity_rules=proximity_for_subset(data,ids,mapping,poses,anchors_for_class,rules))
         radius = initial_radius(parts,gap); start = time.monotonic(); result = None; attempts = 0
         while time.monotonic()-start < per_class and radius <= 20000 and attempts<8:
             attempts += 1; subset['radius'] = radius

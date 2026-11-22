@@ -1,0 +1,46 @@
+"""Explicit electrical placement rules loaded beside the PCB document."""
+import json
+import math
+from pathlib import Path
+
+
+class ElectricalRuleError(ValueError):
+    pass
+
+
+def _rule(item, kind='pin_proximity', required_source_net=''):
+    if not isinstance(item, dict): raise ElectricalRuleError('Each electrical rule must be an object')
+    source, target = item.get('source'), item.get('target')
+    source_net, target_net = item.get('source_net'), item.get('target_net')
+    if not all(isinstance(value, str) and value.strip() for value in (source,target,source_net,target_net)):
+        raise ElectricalRuleError('Each rule needs source, target, source_net and target_net')
+    severity = str(item.get('severity','hard')).lower()
+    if severity not in ('hard','soft'): raise ElectricalRuleError('severity must be hard or soft')
+    try:
+        maximum, weight = float(item.get('max_distance_mil',250)), float(item.get('weight',8))
+    except (TypeError, ValueError) as exc: raise ElectricalRuleError('Distance and weight must be numeric') from exc
+    if not all(math.isfinite(value) for value in (maximum,weight)) or not 0 < maximum <= 5000 or not 0 <= weight <= 100:
+        raise ElectricalRuleError('Invalid electrical rule distance or weight')
+    return dict(kind=kind,source=source.strip(),target=target.strip(),source_net=source_net.strip(),
+                target_net=target_net.strip(),required_source_net=required_source_net.strip(),
+                max_distance=maximum,weight=weight,severity=severity)
+
+
+def load_rules(board_path):
+    """Return normalized pin-proximity rules; absence of a file is valid."""
+    path = Path(board_path).with_name('ClassPlacerRules.json')
+    if not path.exists(): return []
+    try: value = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc: raise ElectricalRuleError('Invalid ClassPlacerRules.json') from exc
+    if not isinstance(value, dict) or value.get('schema') != 'ad-component-placer-rules/v1':
+        raise ElectricalRuleError('Unsupported ClassPlacerRules.json schema')
+    rules = value.get('pin_proximity',[])
+    legacy = value.get('decoupling',[])
+    if not isinstance(rules,list) or not isinstance(legacy,list): raise ElectricalRuleError('Rule collections must be arrays')
+    result = [_rule(item) for item in rules]
+    for item in legacy:
+        if not isinstance(item,dict): raise ElectricalRuleError('Each decoupling rule must be an object')
+        translated=dict(item,source=item.get('capacitor'),target=item.get('ic'),
+                        source_net=item.get('power_net'),target_net=item.get('power_net'))
+        result.append(_rule(translated,'decoupling',str(item.get('ground_net',''))))
+    return result

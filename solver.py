@@ -89,11 +89,32 @@ def intersect(a, b, gap):
     return l < z + gap - .001 and r > x - gap + .001 and d < w + gap - .001 and t > y - gap + .001
 
 
+def proximity_distance(data, pose, rule):
+    """Nearest source pad to the fixed target pad, in mil."""
+    part = data['parts'][rule['source']]
+    x, y, angle = pose
+    return min(math.hypot(x + rotate(px,py,angle-part['pose'][2])[0] - tx,
+                          y + rotate(px,py,angle-part['pose'][2])[1] - ty)
+               for px,py in rule['source_pads'] for tx,ty in rule['targets'])
+
+
+def proximity_cost(data, poses):
+    total = 0.
+    for rule in data.get('proximity_rules',[]):
+        pose = poses[rule['source']]
+        if pose is not None:
+            total += rule['weight'] * proximity_distance(data,pose,rule)
+    return total
+
+
 def legal(data, poses, i, pose):
     # Existing locked/anchor geometry is immutable.  It may legitimately
     # violate today's clearance rule in an already placed board; do not reject
     # the entire batch for that historical condition.  Movable parts still
     # undergo the full boundary and collision test below.
+    for rule in data.get('proximity_rules',[]):
+        if rule['severity'] == 'hard' and rule['source'] == i and proximity_distance(data,pose,rule) > rule['max_distance'] + .001:
+            return False
     if data['parts'][i]['fixed']:
         return True
     box = box_at(data['parts'][i], pose)
@@ -159,7 +180,7 @@ def center_pull(data, poses):
 
 def score(data, poses, weighted=True):
     electrical, raw = wire_scores(data, poses)
-    return electrical + .08 * center_pull(data, poses) if weighted else raw
+    return electrical + proximity_cost(data,poses) + .08 * center_pull(data, poses) if weighted else raw
 
 
 def alignment_cost(data, poses):
@@ -186,7 +207,7 @@ def align_without_regression(data, poses, cancel=None):
     result = poses[:]
     movable = [i for i, part in enumerate(data['parts']) if not part['fixed']]
     electrical, routing = wire_scores(data, result)
-    pull, beauty = center_pull(data, result), alignment_cost(data, result)
+    pull, coupling, beauty = center_pull(data, result), proximity_cost(data,result), alignment_cost(data, result)
     epsilon = .000001
     for _ in range(3):
         changed = False
@@ -207,17 +228,18 @@ def align_without_regression(data, poses, cancel=None):
                 trial = result[:]; trial[i] = candidate
                 next_electrical, next_routing = wire_scores(data, trial)
                 next_pull = center_pull(data, trial)
+                next_coupling = proximity_cost(data, trial)
                 next_beauty = alignment_cost(data, trial)
                 if (next_electrical > electrical + epsilon or next_routing > routing + epsilon or
-                        next_pull > pull + epsilon or next_beauty >= beauty - epsilon):
+                        next_pull > pull + epsilon or next_coupling > coupling + epsilon or next_beauty >= beauty - epsilon):
                     continue
-                key = (next_beauty, next_electrical, next_routing, next_pull)
+                key = (next_beauty, next_electrical, next_routing, next_coupling, next_pull)
                 if best_key is None or key < best_key:
                     best_key, best_pose = key, candidate
             if best_pose is not None:
                 result[i] = best_pose
                 electrical, routing = wire_scores(data, result)
-                pull, beauty = center_pull(data, result), alignment_cost(data, result)
+                pull, coupling, beauty = center_pull(data, result), proximity_cost(data,result), alignment_cost(data, result)
                 changed = True
         if not changed:
             break

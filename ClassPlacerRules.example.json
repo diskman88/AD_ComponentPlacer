@@ -1,0 +1,46 @@
+{
+  "schema": "ad-component-placer-rules/v1",
+  "pin_proximity": [
+    {
+      "kind": "crystal",
+      "source": "X1",
+      "target": "U1",
+      "source_net": "OSC_IN",
+      "target_net": "OSC_IN",
+      "max_distance_mil": 250,
+      "weight": 12,
+      "severity": "hard"
+    },
+    {
+      "kind": "feedback",
+      "source": "R12",
+      "target": "U3",
+      "source_net": "FB",
+      "target_net": "FB",
+      "max_distance_mil": 300,
+      "weight": 10,
+      "severity": "hard"
+    },
+    {
+      "kind": "series_resistor",
+      "source": "R5",
+      "target": "U1",
+      "source_net": "USB_DP_SOC",
+      "target_net": "USB_DP_SOC",
+      "max_distance_mil": 450,
+      "weight": 6,
+      "severity": "soft"
+    }
+  ],
+  "decoupling": [
+    {
+      "capacitor": "C1",
+      "ic": "U1",
+      "power_net": "VDD",
+      "ground_net": "GND",
+      "max_distance_mil": 180,
+      "weight": 15,
+      "severity": "hard"
+    }
+  ]
+}

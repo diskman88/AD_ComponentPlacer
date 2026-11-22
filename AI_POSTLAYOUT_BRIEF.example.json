@@ -1,0 +1,50 @@
+{
+  "schema": "ad-component-placer-ai-postlayout-brief/v1",
+  "handoff": "<job>.snapshot.ai-handoff.json",
+  "mode": "preserve_prelayout",
+  "priority": [
+    "hard_constraints",
+    "electrical_topology",
+    "connection_length",
+    "area_density",
+    "alignment"
+  ],
+  "hard_constraints": {
+    "fixed_components": ["J1", "SW1", "M3"],
+    "board_outline": "read_from_ad",
+    "keepouts": "read_from_ad",
+    "minimum_clearance_mil": 12
+  },
+  "blocks": [
+    {
+      "class": "POWER",
+      "operation": "translate_rigid",
+      "preferred_region": "near DC input connector",
+      "allow_member_delta_mil": 0
+    },
+    {
+      "class": "MCU_CORE",
+      "operation": "translate_then_bounded_adjust",
+      "preferred_region": "digital core area",
+      "allow_member_delta_mil": 80
+    }
+  ],
+  "electrical_rules": [
+    {
+      "kind": "switching_power_loop",
+      "members": ["U3", "L1", "C21", "C22"],
+      "instruction": "Keep the high-current loop compact; do not separate the input capacitor from the switching pins."
+    },
+    {
+      "kind": "connector_edge",
+      "members": ["J1"],
+      "instruction": "Connector position is mechanical and immutable."
+    }
+  ],
+  "approval_required_for": [
+    "rotating a rigid block",
+    "moving a locked component",
+    "moving a member beyond allow_member_delta_mil",
+    "crossing an analog, RF, high-voltage, or isolation boundary"
+  ]
+}

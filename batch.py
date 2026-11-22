@@ -180,6 +180,41 @@ def room_specs(data, indices, poses, gap, centers=None, sides=None):
     return specs
 
 
+def ai_handoff_specs(data, indices, poses, gap, centers=None, sides=None):
+    """Describe completed pre-layout blocks for a later, non-concurrent AI pass.
+
+    This is deliberately descriptive rather than another command format.  The
+    AI/EDA stage starts only after AD has applied this batch, and should treat
+    each group as rigid unless a documented electrical or mechanical conflict
+    requires a bounded local adjustment.
+    """
+    layers = target_layers(data,indices,centers,sides)
+    _, _, choices = _selection(data,indices,centers,sides)
+    by_class = {ci:(anchors_for_class,side) for ci,anchors_for_class,side in choices}
+    groups = []
+    for ci in indices:
+        cls = data['classes'][ci]; anchors_for_class, side = by_class[ci]
+        reference = poses[anchors_for_class[0]]
+        members = []
+        boxes = []
+        for i in cls['members']:
+            x, y, rotation = poses[i]
+            boxes.append(box_at(data['parts'][i],poses[i]))
+            members.append(dict(designator=data['parts'][i]['name'],x=x,y=y,rotation=rotation,
+                                top=layers[i],fixed=data['parts'][i]['fixed'],
+                                dx=x-reference[0],dy=y-reference[1]))
+        groups.append(dict(class_name=cls['name'],center=data['parts'][anchors_for_class[0]]['name'],
+                           centers=[data['parts'][i]['name'] for i in anchors_for_class],side=side,
+                           preserve='rigid_first',members=members,
+                           bounds=dict(left=min(box[0] for box in boxes)-gap,
+                                       bottom=min(box[1] for box in boxes)-gap,
+                                       right=max(box[2] for box in boxes)+gap,
+                                       top=max(box[3] for box in boxes)+gap)))
+    return dict(schema='ad-component-placer-ai-handoff/v1',board=data['board'],project=data['project'],
+                stage='prelayout_complete_wait_for_ad_apply',groups=groups,
+                invariant='Do not run AI/EDA edits until the corresponding .adstatus starts with APPLIED.')
+
+
 def plan_batch(data, indices, gap, per_class, cancel, progress=lambda *args: None,
                centers=None, sides=None):
     if not math.isfinite(gap) or not 0 <= gap <= 1000: raise ValueError('Gap must be 0..1000 mil')
@@ -278,3 +313,6 @@ def publish(data, indices, poses, gap, snapshot, original_bytes, cancel, centers
     rooms_target=Path(str(snapshot)+'.rooms.json'); rooms_temp=Path(str(rooms_target)+'.tmp')
     rooms_temp.write_text(json.dumps(room_specs(data,indices,poses,gap,centers,sides),ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
     rooms_temp.replace(rooms_target)
+    handoff_target=Path(str(snapshot)+'.ai-handoff.json'); handoff_temp=Path(str(handoff_target)+'.tmp')
+    handoff_temp.write_text(json.dumps(ai_handoff_specs(data,indices,poses,gap,centers,sides),ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+    handoff_temp.replace(handoff_target)

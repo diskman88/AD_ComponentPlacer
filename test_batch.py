@@ -7,7 +7,7 @@ import threading
 import time
 import unittest
 
-from batch import load,center_options,center_indices,class_info,initial_radius,room_specs,select_classes,target_layers,plan_batch,validate_batch,publish
+from batch import ai_handoff_specs,load,center_options,center_indices,class_info,initial_radius,room_specs,select_classes,target_layers,plan_batch,validate_batch,publish
 from solver import Cancelled,align_without_regression,box_at,intersect,legal,score,solve,validate,wire_scores
 from class_desktop import work
 from install import install
@@ -108,6 +108,9 @@ class BatchTests(unittest.TestCase):
             self.assertEqual(result[:len(d['lines'])],d['lines'])
             self.assertEqual(result[len(d['lines'])],'CPCLASSPLAN5')
             self.assertEqual(len(result),len(d['lines'])+3+4+1+len(poses)*5)
+            handoff=json.loads(Path(str(p)+'.ai-handoff.json').read_text(encoding='utf-8'))
+            self.assertEqual(handoff['schema'],'ad-component-placer-ai-handoff/v1')
+            self.assertEqual(handoff['groups'][0]['class_name'],'POWER')
 
     def test_process_worker(self):
         with tempfile.TemporaryDirectory() as td:
@@ -215,6 +218,16 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(room['bounds'],dict(left=978.,bottom=978.,right=3022.,top=3022.))
         self.assertTrue(room['room_enabled'])
         self.assertFalse(room['follow_locked_center'])
+
+    def test_ai_handoff_preserves_pre_layout_blocks(self):
+        d=fixture();poses=[p['pose'] for p in d['parts']]
+        poses[1]=(1200.,1100.,90.)
+        handoff=ai_handoff_specs(d,[0],poses,12.)
+        self.assertEqual(handoff['schema'],'ad-component-placer-ai-handoff/v1')
+        self.assertEqual(handoff['groups'][0]['preserve'],'rigid_first')
+        c1=next(member for member in handoff['groups'][0]['members'] if member['designator']=='C1')
+        self.assertEqual((c1['dx'],c1['dy']),(200.,100.))
+        self.assertIn('APPLIED',handoff['invariant'])
 
     def test_locked_center_is_room_free_but_still_avoids_obstacles(self):
         d=fixture();d['parts'][0]['fixed']=True

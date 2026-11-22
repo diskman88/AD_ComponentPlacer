@@ -1,0 +1,10 @@
+[Design]
+Version=1.0
+
+[Document1]
+DocumentPath=ClassPlacer.pas
+AnnotationEnabled=1
+
+[Document2]
+DocumentPath=ClassPlacer.dfm
+AnnotationEnabled=1

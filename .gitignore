@@ -1,0 +1,19 @@
+# Python bytecode and local test state
+__pycache__/
+*.py[cod]
+
+# Per-run Class Placer outputs; they contain board-local paths and state.
+*.snapshot
+*.snapshot.*
+*.plan
+*.rooms.json
+*.report.json
+*.status
+*.worker.log
+*.ad.log
+*.adstatus
+*.restore
+*.cancel
+*.tmp
+*.classplacer_jobs/
+@AutomationLog.txt

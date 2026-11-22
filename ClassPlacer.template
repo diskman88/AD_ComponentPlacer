@@ -1,0 +1,449 @@
+{ Class Placer 0.4. Native side performs bounded reads, timer polling, and atomic batch apply.
+  Optimization, center selection, side allocation, and Room manifests run in the external Python process. }
+Var
+ BCBoard : IPCB_Board;
+ BCParts : Array[0..2047] Of IPCB_Component;
+ BCNames : Array[0..2047] Of String;
+ BCX,BCY,BCA,BCL,BCB,BCR,BCT,BCNewX,BCNewY,BCNewA : Array[0..2047] Of Double;
+ BCLocked,BCTop,BCNewTop,BCAllowed,BCAnchor,BCChanged : Array[0..2047] Of Boolean;
+ BCCNames : Array[0..255] Of String;
+ BCCMembers : Array[0..255] Of TStringList;
+ BCN,BCCN : Integer;
+ BCCenters,BCSourceClasses,BCOriginal : TStringList;
+ BCPath,BCProjectPath,BCJob,BCFailure,BCLastHeartbeat : String;
+ BCReadingStarted,BCStarted,BCLastStatus : Double;
+ BCBusy,BCFinished : Boolean;
+
+Function BCMin(A,B : Double) : Double;
+Begin If A<B Then Result:=A Else Result:=B; End;
+Function BCMax(A,B : Double) : Double;
+Begin If A>B Then Result:=A Else Result:=B; End;
+Procedure BCWrite(Path,Text : String);
+Var S : TStringList;
+Begin S:=TStringList.Create; Try S.Add(Text); S.SaveToFile(Path); Finally S.Free; End; End;
+Procedure BCLog(Text : String);
+Var S : TStringList;
+Begin
+ S:=TStringList.Create;
+ Try
+  If FileExists(BCJob+'.ad.log') Then S.LoadFromFile(BCJob+'.ad.log');
+  S.Add(FormatDateTime('hh:nn:ss',Now)+' '+Text); S.SaveToFile(BCJob+'.ad.log');
+ Finally S.Free; End;
+End;
+Procedure BCFail(Text : String);
+Begin
+ BCFailure:=Text;
+ Try BCLog('ERROR '+Text); Except End;
+ Raise(Text);
+End;
+Procedure BCGuard;
+Begin
+ If (Now-BCReadingStarted)*86400>30 Then BCFail('Class Placer read timeout; PCB not changed');
+End;
+Procedure BCFreeClasses;
+Var I : Integer;
+Begin For I:=0 To BCCN-1 Do BCCMembers[I].Free; BCCN:=0; End;
+
+Procedure BCMetadata;
+Var W : IWorkspace; P,Found : IProject; D : IDocument; M : IComponent;
+    I,J,K,L,Docs,Seen : Integer; Physical : Boolean; Name,Center,Classes,Key : String;
+Begin
+ BCCenters.Clear; BCSourceClasses.Clear; Found:=Nil;
+ W:=GetWorkspace;
+ If W=Nil Then BCFail('No workspace');
+ For I:=0 To W.DM_ProjectCount-1 Do
+ Begin
+  P:=W.DM_Projects(I);
+  For J:=0 To P.DM_LogicalDocumentCount-1 Do
+  Begin
+   BCGuard; D:=P.DM_LogicalDocuments(J);
+   If UpperCase(D.DM_FullPath)=UpperCase(BCPath) Then Found:=P;
+  End;
+ End;
+ If Found=Nil Then BCFail('Active PCB must belong to an open PCB project');
+ BCProjectPath:=Found.DM_ProjectFullPath;
+ BCLog('COMPILE_BEGIN '+BCProjectPath);
+ Found.DM_Compile;
+ BCLog('COMPILE_DONE'); BCGuard;
+ Docs:=Found.DM_PhysicalDocumentCount; Physical:=Docs>0;
+ If Not Physical Then Docs:=Found.DM_LogicalDocumentCount;
+ If Docs>1024 Then BCFail('Too many project documents');
+ Seen:=0;
+ For I:=0 To Docs-1 Do
+ Begin
+  If Physical Then D:=Found.DM_PhysicalDocuments(I) Else D:=Found.DM_LogicalDocuments(I);
+  If D<>Nil Then
+   If LowerCase(ExtractFileExt(D.DM_FullPath))='.schdoc' Then
+   For J:=0 To D.DM_ComponentCount-1 Do
+   Begin
+    BCGuard; Seen:=Seen+1; If Seen>20000 Then BCFail('Schematic component limit exceeded');
+    M:=D.DM_Components(J); Name:=M.DM_PhysicalDesignator;
+    Center:=''; Classes:='';
+    If M.DM_ParameterCount>1024 Then BCFail('Too many component parameters');
+    For K:=0 To M.DM_ParameterCount-1 Do
+    Begin
+     Key:=UpperCase(Trim(M.DM_Parameters(K).DM_Name));
+     If Key='CENTERCOMPONENT' Then
+     Begin
+      If (Center<>'') And (UpperCase(Center)<>UpperCase(Trim(M.DM_Parameters(K).DM_Value))) Then
+       Center:='!CONFLICT!' Else Center:=Trim(M.DM_Parameters(K).DM_Value);
+     End;
+     If Key='CLASSNAME' Then Classes:=Trim(M.DM_Parameters(K).DM_Value);
+    End;
+    L:=BCCenters.IndexOfName(Name);
+    If L>=0 Then
+    Begin
+     If UpperCase(BCCenters.Values[Name])<>UpperCase(Center) Then Center:='!CONFLICT!';
+    End;
+    BCCenters.Values[Name]:=Center; BCSourceClasses.Values[Name]:=Classes;
+   End;
+ End;
+ BCLog('METADATA_DONE');
+End;
+
+Procedure BCCollect(S : TStringList);
+Var It,CI : IPCB_BoardIterator; GI : IPCB_GroupIterator;
+    C : IPCB_Component; Pad : IPCB_Pad; Cls : IPCB_ObjectClass; Box : TCoordRect;
+ I,J,K,L,PadN,Scanned,PadScanned,ClassScanned : Integer; Pads : TStringList; Name,Member : String;
+Begin
+ BCReadingStarted:=Now; BCLog('READ_BEGIN'); BCMetadata;
+ BCFreeClasses; BCN:=0; Scanned:=0; PadScanned:=0; ClassScanned:=0; PadN:=0;
+ S.Clear; S.Add('CPCLASS3'); S.Add(BCPath); S.Add(BCProjectPath);
+ Pads:=TStringList.Create;
+ Try
+ It:=BCBoard.BoardIterator_Create;
+ Try
+  It.AddFilter_ObjectSet(MkSet(eComponentObject)); It.AddFilter_LayerSet(AllLayers); It.AddFilter_Method(eProcessAll);
+  C:=It.FirstPCBObject;
+  While C<>Nil Do
+  Begin
+   BCGuard; Scanned:=Scanned+1;
+   If Scanned>10000 Then BCFail('Component iterator limit');
+   If BCN>=2048 Then BCFail('Limit: 2048 board components');
+   I:=BCN; BCN:=BCN+1; BCParts[I]:=C; BCNames[I]:=C.Name.Text;
+   BCX[I]:=C.X/10000.0; BCY[I]:=C.Y/10000.0; BCA[I]:=C.Rotation;
+   Box:=C.BoundingRectangleNoNameComment;
+   BCL[I]:=Box.X1/10000.0-BCX[I]; BCB[I]:=Box.Y1/10000.0-BCY[I];
+   BCR[I]:=Box.X2/10000.0-BCX[I]; BCT[I]:=Box.Y2/10000.0-BCY[I];
+   BCLocked[I]:=Not C.Moveable; BCTop[I]:=C.Layer=eTopLayer;
+   GI:=C.GroupIterator_Create;
+   Try
+    GI.AddFilter_ObjectSet(MkSet(ePadObject)); Pad:=GI.FirstPCBObject;
+    While Pad<>Nil Do
+    Begin
+     BCGuard; PadScanned:=PadScanned+1; If PadScanned>100000 Then BCFail('Pad iterator limit');
+     If Pad.Net<>Nil Then
+     Begin
+      PadN:=PadN+1; If PadN>65536 Then BCFail('Limit: 65536 connected pads');
+      Pads.Add(IntToStr(I)); Pads.Add(Pad.Net.Name);
+      Pads.Add(FloatToStr(Pad.X/10000.0-BCX[I])); Pads.Add(FloatToStr(Pad.Y/10000.0-BCY[I]));
+     End;
+     Pad:=GI.NextPCBObject;
+    End;
+   Finally C.GroupIterator_Destroy(GI); End;
+   C:=It.NextPCBObject;
+  End;
+ Finally BCBoard.BoardIterator_Destroy(It); End;
+  If BCN=0 Then BCFail('PCB has no components');
+  S.Add(IntToStr(BCN));
+  For I:=0 To BCN-1 Do
+  Begin
+   S.Add(BCNames[I]); S.Add(FloatToStr(BCX[I])); S.Add(FloatToStr(BCY[I])); S.Add(FloatToStr(BCA[I]));
+   S.Add(FloatToStr(BCL[I])); S.Add(FloatToStr(BCB[I])); S.Add(FloatToStr(BCR[I])); S.Add(FloatToStr(BCT[I]));
+   If BCLocked[I] Then S.Add('1') Else S.Add('0');
+   If BCTop[I] Then S.Add('1') Else S.Add('0');
+   S.Add(BCCenters.Values[BCNames[I]]); S.Add(BCSourceClasses.Values[BCNames[I]]);
+  End;
+  S.Add(IntToStr(PadN)); S.AddStrings(Pads);
+ Finally Pads.Free; End;
+ CI:=BCBoard.BoardIterator_Create;
+ Try
+  CI.AddFilter_ObjectSet(MkSet(eClassObject)); CI.AddFilter_LayerSet(AllLayers); CI.AddFilter_Method(eProcessAll);
+  Cls:=CI.FirstPCBObject;
+  While Cls<>Nil Do
+  Begin
+   BCGuard; ClassScanned:=ClassScanned+1; If ClassScanned>2000 Then BCFail('Class iterator limit');
+   If (Cls.MemberKind=eClassMemberKind_Component) And (Not Cls.SuperClass) Then
+   Begin
+    Name:=Cls.Name;
+    If (Name<>'') And (Copy(Name,1,1)<>'<') And (UpperCase(Name)<>'ALL COMPONENTS') And
+     (UpperCase(Name)<>'TOP SIDE COMPONENTS') And (UpperCase(Name)<>'BOTTOM SIDE COMPONENTS') And
+     (UpperCase(Name)<>'INSIDE BOARD COMPONENTS') And (UpperCase(Name)<>'OUTSIDE BOARD COMPONENTS') Then
+    Begin
+     If BCCN>=256 Then BCFail('Limit: 256 component classes');
+     I:=BCCN; BCCN:=BCCN+1; BCCNames[I]:=Name; BCCMembers[I]:=TStringList.Create;
+     { In recent AD builds IsMember can return False for every component in an
+       existing Component Class.  Read the class's authoritative member names
+       directly, then resolve them against the PCB component snapshot. }
+     J:=0; Member:=Cls.MemberName[J];
+     While Member<>'' Do
+     Begin
+      BCGuard; If J>=2048 Then BCFail('Component class member limit');
+      L:=-1;
+      For K:=0 To BCN-1 Do
+       If UpperCase(Trim(BCNames[K]))=UpperCase(Trim(Member)) Then L:=K;
+      If L<0 Then
+       BCLog('CLASS_MEMBER_MISSING '+Name+' '+Member)
+      Else
+      Begin
+       If BCCMembers[I].IndexOf(IntToStr(L))>=0 Then BCFail('Duplicate member '+Member+' in component class '+Name);
+       BCCMembers[I].Add(IntToStr(L));
+      End;
+      J:=J+1; Member:=Cls.MemberName[J];
+     End;
+    End;
+   End;
+   Cls:=CI.NextPCBObject;
+  End;
+ Finally BCBoard.BoardIterator_Destroy(CI); End;
+ S.Add(IntToStr(BCCN));
+ For I:=0 To BCCN-1 Do
+ Begin S.Add(BCCNames[I]); S.Add(IntToStr(BCCMembers[I].Count)); S.AddStrings(BCCMembers[I]); End;
+ BCLog('READ_DONE '+IntToStr(BCN)+' components '+IntToStr(BCCN)+' classes');
+End;
+
+Function BCParse(S : String) : Double;
+Begin
+ If Pos(',',FloatToStr(0.5))>0 Then S:=StringReplace(S,'.',',',MkSet(rfReplaceAll));
+ Result:=StrToFloat(S);
+ If Result<>Result Then BCFail('Non-finite coordinate');
+End;
+Procedure BCBox(I : Integer; X,Y,A : Double; Var L,B,R,T : Double);
+Var K : Integer; DX,DY,RX,RY,Angle : Double;
+Begin
+ L:=1E20; B:=1E20; R:=-1E20; T:=-1E20; Angle:=(A-BCA[I])*3.141592653589793/180.0;
+ For K:=0 To 3 Do
+ Begin
+  If (K=0) Or (K=1) Then DX:=BCL[I] Else DX:=BCR[I];
+  If (K=0) Or (K=2) Then DY:=BCB[I] Else DY:=BCT[I];
+  RX:=DX*Cos(Angle)-DY*Sin(Angle); RY:=DX*Sin(Angle)+DY*Cos(Angle);
+  L:=BCMin(L,X+RX); R:=BCMax(R,X+RX); B:=BCMin(B,Y+RY); T:=BCMax(T,Y+RY);
+ End;
+End;
+Procedure BCSet(C : IPCB_Component; X,Y,A : Double; Top : Boolean);
+Begin
+ PCBServer.SendMessageToRobots(C.I_ObjectAddress,c_Broadcast,PCBM_BeginModify,c_NoEventData);
+ Try
+  If Top Then C.Layer:=eTopLayer Else C.Layer:=eBottomLayer;
+  C.Rotation:=A; C.MoveByXY(Round(X*10000)-C.X,Round(Y*10000)-C.Y);
+ Finally PCBServer.SendMessageToRobots(C.I_ObjectAddress,c_Broadcast,PCBM_EndModify,c_NoEventData); End;
+End;
+Procedure BCApply;
+Var Current,Plan,Restore,Link : TStringList; I,J,K,Base,NC,CI,Member,AnchorCount,AnchorNumber,AnchorMember : Integer;
+    Center,TargetSide : String; TargetLayer : Integer; Gap,L,B,R,T,L2,B2,R2,T2 : Double; Valid : Boolean;
+Begin
+ If PCBServer.GetCurrentPCBBoard<>BCBoard Then BCFail('Active PCB changed; batch not applied');
+ Current:=TStringList.Create; Plan:=TStringList.Create; Restore:=TStringList.Create; Link:=TStringList.Create;
+ Try
+  BCFailure:='Could not re-read the current PCB/project'; BCCollect(Current);
+  If Current.Count<>BCOriginal.Count Then BCFail('Board/project changed; rerun batch');
+  For I:=0 To Current.Count-1 Do If Current[I]<>BCOriginal[I] Then BCFail('Board, classes or schematic parameters changed; rerun batch');
+  Plan.LoadFromFile(BCJob+'.plan'); Base:=Current.Count;
+  If Plan.Count<Base+4+BCN*5 Then BCFail('Incomplete batch result');
+  For I:=0 To Base-1 Do If Plan[I]<>Current[I] Then BCFail('Result belongs to another snapshot');
+  If Plan[Base]<>'CPCLASSPLAN5' Then BCFail('Invalid plan version');
+  Gap:=BCParse(Plan[Base+1]); If (Gap<0) Or (Gap>1000) Then BCFail('Invalid gap');
+  NC:=StrToInt(Plan[Base+2]); If (NC<1) Or (NC>BCCN) Then BCFail('Invalid selected class count');
+  For I:=0 To BCN-1 Do Begin BCAllowed[I]:=False; BCAnchor[I]:=False; BCNewTop[I]:=BCTop[I]; End;
+  Link.Clear;
+  K:=Base+3;
+  For I:=0 To NC-1 Do
+  Begin
+   CI:=StrToInt(Plan[K]); K:=K+1; TargetSide:=UpperCase(Trim(Plan[K])); K:=K+1; AnchorCount:=StrToInt(Plan[K]); K:=K+1;
+   If (CI<0) Or (CI>=BCCN) Then BCFail('Invalid class index');
+   If Link.IndexOf(IntToStr(CI))>=0 Then BCFail('Duplicate selected class'); Link.Add(IntToStr(CI));
+   If BCCMembers[CI].Count=0 Then BCFail('Empty class selected');
+   If (TargetSide<>'KEEP') And (TargetSide<>'TOP') And (TargetSide<>'BOTTOM') Then BCFail('Invalid target side');
+   If (AnchorCount<1) Or (AnchorCount>BCCMembers[CI].Count) Then BCFail('Invalid center count');
+   For J:=0 To BCCMembers[CI].Count-1 Do
+   Begin
+    Member:=StrToInt(BCCMembers[CI][J]);
+    If BCAllowed[Member] And (Not BCLocked[Member]) Then BCFail('Selected classes share movable members');
+    BCAllowed[Member]:=True;
+   End;
+   For AnchorNumber:=0 To AnchorCount-1 Do
+   Begin
+    Center:=UpperCase(Trim(Plan[K])); K:=K+1; AnchorMember:=-1;
+    For J:=0 To BCCMembers[CI].Count-1 Do
+    Begin Member:=StrToInt(BCCMembers[CI][J]); If UpperCase(BCNames[Member])=Center Then AnchorMember:=Member; End;
+    If AnchorMember<0 Then BCFail('Selected center is not a class member');
+    If BCAnchor[AnchorMember] Then BCFail('Duplicate selected center'); BCAnchor[AnchorMember]:=True;
+    If (TargetSide='TOP') And (Not BCTop[AnchorMember]) Then BCFail('Target side differs from fixed center side');
+    If (TargetSide='BOTTOM') And BCTop[AnchorMember] Then BCFail('Target side differs from fixed center side');
+   End;
+   If TargetSide='TOP' Then
+    For J:=0 To BCCMembers[CI].Count-1 Do Begin Member:=StrToInt(BCCMembers[CI][J]); If (Not BCAnchor[Member]) And (Not BCLocked[Member]) Then BCNewTop[Member]:=True; End;
+   If TargetSide='BOTTOM' Then
+    For J:=0 To BCCMembers[CI].Count-1 Do Begin Member:=StrToInt(BCCMembers[CI][J]); If (Not BCAnchor[Member]) And (Not BCLocked[Member]) Then BCNewTop[Member]:=False; End;
+  End;
+  If Plan.Count<>K+1+BCN*5 Then BCFail('Invalid result length');
+  If StrToInt(Plan[K])<>BCN Then BCFail('Wrong result component count'); K:=K+1;
+  For I:=0 To BCN-1 Do
+  Begin
+   If Plan[K]<>BCNames[I] Then BCFail('Result designator mismatch');
+   BCNewX[I]:=BCParse(Plan[K+1]); BCNewY[I]:=BCParse(Plan[K+2]); BCNewA[I]:=BCParse(Plan[K+3]); TargetLayer:=StrToInt(Plan[K+4]); K:=K+5;
+   If (TargetLayer<>0) And (TargetLayer<>1) Then BCFail('Invalid target layer');
+   If (TargetLayer=1)<>BCNewTop[I] Then BCFail('Target layer does not match class choice');
+   If (Abs(BCNewX[I])>200000) Or (Abs(BCNewY[I])>200000) Or (BCNewA[I]<0) Or (BCNewA[I]>360) Then BCFail('Pose outside coordinate range');
+   BCChanged[I]:=(Abs(BCNewX[I]-BCX[I])>0.00001) Or (Abs(BCNewY[I]-BCY[I])>0.00001) Or (Abs(BCNewA[I]-BCA[I])>0.00001) Or (BCNewTop[I]<>BCTop[I]);
+   If BCChanged[I] And ((Not BCAllowed[I]) Or BCLocked[I] Or BCAnchor[I]) Then BCFail('Result moves a protected component');
+  End;
+  For I:=0 To BCN-1 Do
+   If BCChanged[I] Then
+   Begin
+    BCGuard;
+    BCBox(I,BCNewX[I],BCNewY[I],BCNewA[I],L,B,R,T);
+    For J:=0 To BCN-1 Do If J<>I Then
+    Begin
+     BCBox(J,BCNewX[J],BCNewY[J],BCNewA[J],L2,B2,R2,T2);
+     If (L<R2+Gap-0.001) And (R>L2-Gap+0.001) And (B<T2+Gap-0.001) And (T>B2-Gap+0.001) Then BCFail('Final collision '+BCNames[I]+' / '+BCNames[J]);
+    End;
+   End;
+  If FileExists(BCJob+'.cancel') Then BCFail('Cancelled before application');
+  Restore.Add('CPCLASSRESTORE4'); Restore.Add(BCPath); Restore.Add(IntToStr(BCN));
+  For I:=0 To BCN-1 Do
+  Begin Restore.Add(BCNames[I]); Restore.Add(FloatToStr(BCX[I])); Restore.Add(FloatToStr(BCY[I])); Restore.Add(FloatToStr(BCA[I])); If BCTop[I] Then Restore.Add('1') Else Restore.Add('0'); End;
+  Restore.SaveToFile(BCJob+'.restore'); Link.Clear; Link.Add(BCJob+'.restore'); Link.SaveToFile(BCPath+'.classplacer.lastrestore.txt');
+  BCLog('APPLY_BEGIN'); BCFailure:='AD write/readback failed; inspect before saving'; Valid:=True;
+  PCBServer.PreProcess;
+  Try
+   Try
+   For I:=0 To BCN-1 Do If BCChanged[I] Then BCSet(BCParts[I],BCNewX[I],BCNewY[I],BCNewA[I],BCNewTop[I]);
+    For I:=0 To BCN-1 Do
+     If (Abs(BCParts[I].X-Round(BCNewX[I]*10000))>2) Or (Abs(BCParts[I].Y-Round(BCNewY[I]*10000))>2) Or (Abs(BCParts[I].Rotation-BCNewA[I])>0.01) Or ((BCParts[I].Layer=eTopLayer)<>BCNewTop[I]) Then Valid:=False;
+   Except Valid:=False; End;
+   If Not Valid Then For I:=0 To BCN-1 Do If BCChanged[I] Then BCSet(BCParts[I],BCX[I],BCY[I],BCA[I],BCTop[I]);
+  Finally PCBServer.PostProcess; End;
+  BCBoard.ViewManager_FullUpdate;
+  If Not Valid Then BCFail('Write/readback failed; rollback attempted. Inspect before saving');
+  BCLog('APPLY_DONE'); BCWrite(BCJob+'.adstatus','APPLIED: Batch complete. PCB left unsaved.');
+ Finally Link.Free; Restore.Free; Plan.Free; Current.Free; End;
+End;
+
+Procedure TClassPlacerProgress.PollTimerTimer(Sender : TObject);
+Var S : TStringList;
+Begin
+ If BCBusy Or BCFinished Then Exit; BCBusy:=True;
+ S:=TStringList.Create;
+ Try
+  Try
+   If FileExists(BCJob+'.cancel') Then
+   Begin BCFinished:=True; ClassPlacerProgress.PollTimer.Enabled:=False; ClassPlacerProgress.ModalResult:=mrCancel; Exit; End;
+   If FileExists(BCJob+'.status') Then
+   Begin
+    S.LoadFromFile(BCJob+'.status');
+    If S.Count>1 Then
+    Begin
+     ClassPlacerProgress.StageLabel.Caption:=S[1];
+     If S[0]='READY' Then
+     Begin
+      ClassPlacerProgress.PollTimer.Enabled:=False; BCApply; BCFinished:=True; ClassPlacerProgress.ModalResult:=mrOk; Exit;
+     End;
+     If (S[0]='ERROR') Or (S[0]='CANCELLED') Then
+     Begin
+      BCFinished:=True; ClassPlacerProgress.PollTimer.Enabled:=False; ClassPlacerProgress.ModalResult:=mrCancel;
+      If S[0]='ERROR' Then Begin BCLog('EXTERNAL_ERROR '+S[1]); ShowMessage('Batch not applied: '+S[1]); End;
+      Exit;
+     End;
+    End;
+    If S.Count>2 Then
+     If S[2]<>BCLastHeartbeat Then Begin BCLastHeartbeat:=S[2]; BCLastStatus:=Now; End;
+    If (Now-BCLastStatus)*86400>60 Then BCFail('External process heartbeat expired');
+   End
+   Else If (Now-BCStarted)*86400>20 Then BCFail('External program did not start. Run Setup.cmd again');
+  Except
+   BCFinished:=True; ClassPlacerProgress.PollTimer.Enabled:=False;
+   BCWrite(BCJob+'.adstatus','ERROR: '+BCFailure);
+   BCWrite(BCJob+'.cancel','cancel');
+   ClassPlacerProgress.ModalResult:=mrCancel;
+   ShowMessage('Class Placer stopped: '+BCFailure+#13+'Inspect the PCB before saving. Log: '+BCJob+'.ad.log');
+  End;
+ Finally S.Free; BCBusy:=False; End;
+End;
+Procedure TClassPlacerProgress.CancelButtonClick(Sender : TObject);
+Begin
+ BCWrite(BCJob+'.cancel','cancel'); BCFinished:=True;
+ ClassPlacerProgress.PollTimer.Enabled:=False; ClassPlacerProgress.ModalResult:=mrCancel;
+End;
+Procedure TClassPlacerProgress.FormClose(Sender : TObject; Var Action : TCloseAction);
+Begin
+ ClassPlacerProgress.PollTimer.Enabled:=False;
+ If Not BCFinished Then BCWrite(BCJob+'.cancel','cancel');
+End;
+
+Procedure RunClassPlacement;
+Var Dir,Command : String; Code : Integer;
+Begin
+ If Not FileExists(@PYTHON@) Then Begin ShowMessage('Run Setup.cmd once in the extracted tool folder first.'); Exit; End;
+ BCBoard:=PCBServer.GetCurrentPCBBoard;
+ If BCBoard=Nil Then Begin ShowMessage('Activate a saved PCB document first.'); Exit; End;
+ BCPath:=BCBoard.FileName;
+ If BCPath='' Then Begin ShowMessage('Save PCB first.'); Exit; End;
+ BCOriginal:=TStringList.Create; BCCenters:=TStringList.Create; BCSourceClasses:=TStringList.Create; BCCN:=0;
+ Try
+  Dir:=BCPath+'.classplacer_jobs'; ForceDirectories(Dir);
+  BCJob:=Dir+'\'+FormatDateTime('yyyymmdd_hhnnss_zzz',Now)+'.snapshot';
+  Try
+  BCFailure:='Unable to read PCB/project metadata'; BCCollect(BCOriginal); BCOriginal.SaveToFile(BCJob);
+  Command:='"'+@PYTHON@+'" "'+@RUNNER@+'" "'+BCJob+'"';
+  Code:=RunApplication(Command);
+  If Code<>0 Then BCFail('Cannot start external class selector. Run Setup.cmd and inspect Python installation');
+  BCStarted:=Now; BCLastStatus:=Now; BCLastHeartbeat:=''; BCBusy:=False; BCFinished:=False;
+  ClassPlacerProgress.StageLabel.Caption:='Choose classes in the Class Placer window. Results apply automatically.';
+  ClassPlacerProgress.Visible:=False; ClassPlacerProgress.ModalResult:=0; ClassPlacerProgress.PollTimer.Enabled:=True;
+  ClassPlacerProgress.ShowModal;
+  Except
+   If BCJob<>'' Then BCWrite(BCJob+'.cancel','cancel');
+   ShowMessage('Class Placer stopped before completion: '+BCFailure+#13+'Log: '+BCJob+'.ad.log');
+  End;
+ Finally
+  ClassPlacerProgress.PollTimer.Enabled:=False;
+  BCFreeClasses; BCOriginal.Free; BCCenters.Free; BCSourceClasses.Free;
+ End;
+End;
+
+Procedure RestoreClassPlacement;
+Var B : IPCB_Board; S,Link : TStringList; N,I,K : Integer; Path : String;
+Begin
+ B:=PCBServer.GetCurrentPCBBoard;
+ If B=Nil Then Begin ShowMessage('Activate the original PCB.'); Exit; End;
+ S:=TStringList.Create; Link:=TStringList.Create;
+ Try
+  Try
+  BCFailure:='Cannot read class placement restore point';
+  Path:=B.FileName+'.classplacer.lastrestore.txt';
+  If Not FileExists(Path) Then Begin ShowMessage('No class placement restore point.'); Exit; End;
+  Link.LoadFromFile(Path); If Link.Count<>1 Then BCFail('Invalid restore link');
+  S.LoadFromFile(Link[0]);
+  If (S.Count<3) Or (S[0]<>'CPCLASSRESTORE4') Or (UpperCase(S[1])<>UpperCase(B.FileName)) Then BCFail('Wrong restore file');
+  N:=StrToInt(S[2]); If (N<1) Or (N>2048) Or (S.Count<>3+N*5) Then BCFail('Invalid restore count');
+  For I:=0 To N-1 Do
+  Begin
+   K:=3+I*5; BCParts[I]:=B.GetPcbComponentByRefDes(S[K]);
+   If BCParts[I]=Nil Then BCFail('A restore component is missing');
+   BCNewX[I]:=BCParse(S[K+1]); BCNewY[I]:=BCParse(S[K+2]); BCNewA[I]:=BCParse(S[K+3]);
+   BCNewTop[I]:=StrToInt(S[K+4])=1; If (StrToInt(S[K+4])<>0) And (StrToInt(S[K+4])<>1) Then BCFail('Invalid restore layer');
+   BCChanged[I]:=(Abs(BCParts[I].X/10000.0-BCNewX[I])>0.0001) Or (Abs(BCParts[I].Y/10000.0-BCNewY[I])>0.0001) Or (Abs(BCParts[I].Rotation-BCNewA[I])>0.001) Or ((BCParts[I].Layer=eTopLayer)<>BCNewTop[I]);
+   If BCChanged[I] And (Not BCParts[I].Moveable) Then BCFail('Unlock moved restore targets first');
+  End;
+  If MessageDlg('Restore previous batch positions? PCB will remain unsaved.',mtConfirmation,mbYesNo,0)<>mrYes Then Exit;
+  PCBServer.PreProcess;
+  Try For I:=0 To N-1 Do If BCChanged[I] Then BCSet(BCParts[I],BCNewX[I],BCNewY[I],BCNewA[I],BCNewTop[I]);
+  Finally PCBServer.PostProcess; End;
+  B.ViewManager_FullUpdate; ShowMessage('Positions restored. Inspect before saving.');
+  Except ShowMessage('Restore stopped: '+BCFailure); End;
+ Finally S.Free; Link.Free; End;
+End;
+
+Procedure ClassPlacerSelfTest;
+Var S : TStringList; L,B,R,T : Double;
+Begin
+ S:=TStringList.Create;
+ Try
+  BCBox(0,1000.0,2000.0,90.0,L,B,R,T);
+  S.Add('BCBox='+FloatToStr(L)+','+FloatToStr(B)+','+FloatToStr(R)+','+FloatToStr(T));
+  S.Add('BCParse='+FloatToStr(BCParse('123.5')));
+  S.Add('Min='+FloatToStr(BCMin(1.0,2.0))+' Max='+FloatToStr(BCMax(1.0,2.0)));
+  S.SaveToFile('H:\AD_ClassPlacer_030\selftest.txt');
+ Finally S.Free; End;
+End;

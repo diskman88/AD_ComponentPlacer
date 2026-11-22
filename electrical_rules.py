@@ -26,14 +26,19 @@ def _rule(item, kind='pin_proximity', required_source_net=''):
                 max_distance=maximum,weight=weight,severity=severity)
 
 
-def load_rules(board_path):
-    """Return normalized pin-proximity rules; absence of a file is valid."""
+def _load_document(board_path):
     path = Path(board_path).with_name('ClassPlacerRules.json')
-    if not path.exists(): return []
+    if not path.exists(): return {}
     try: value = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc: raise ElectricalRuleError('Invalid ClassPlacerRules.json') from exc
     if not isinstance(value, dict) or value.get('schema') != 'ad-component-placer-rules/v1':
         raise ElectricalRuleError('Unsupported ClassPlacerRules.json schema')
+    return value
+
+
+def load_rules(board_path):
+    """Return normalized pin-proximity rules; absence of a file is valid."""
+    value = _load_document(board_path)
     rules = value.get('pin_proximity',[])
     legacy = value.get('decoupling',[])
     if not isinstance(rules,list) or not isinstance(legacy,list): raise ElectricalRuleError('Rule collections must be arrays')
@@ -43,4 +48,24 @@ def load_rules(board_path):
         translated=dict(item,source=item.get('capacitor'),target=item.get('ic'),
                         source_net=item.get('power_net'),target_net=item.get('power_net'))
         result.append(_rule(translated,'decoupling',str(item.get('ground_net',''))))
+    return result
+
+
+def load_manual_overrides(board_path):
+    value = _load_document(board_path)
+    entries = value.get('manual_overrides',[])
+    if not isinstance(entries,list): raise ElectricalRuleError('manual_overrides must be an array')
+    result = {}
+    for entry in entries:
+        if not isinstance(entry,dict) or not isinstance(entry.get('component'),str) or not entry['component'].strip():
+            raise ElectricalRuleError('Each manual override needs a component')
+        name = entry['component'].strip().upper()
+        if name in result: raise ElectricalRuleError('Duplicate manual override: '+entry['component'])
+        lock_position = entry.get('lock_position',False); preserve_rotation = entry.get('preserve_rotation',False)
+        if not isinstance(lock_position,bool) or not isinstance(preserve_rotation,bool):
+            raise ElectricalRuleError('Manual override booleans are invalid')
+        try: max_shift = float(entry.get('max_shift_mil',0))
+        except (TypeError, ValueError) as exc: raise ElectricalRuleError('max_shift_mil must be numeric') from exc
+        if not math.isfinite(max_shift) or not 0 <= max_shift <= 20000: raise ElectricalRuleError('Invalid max_shift_mil')
+        result[name] = dict(lock_position=lock_position,preserve_rotation=preserve_rotation,max_shift=max_shift)
     return result

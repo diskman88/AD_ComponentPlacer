@@ -42,5 +42,17 @@
       "weight": 15,
       "severity": "hard"
     }
+  ],
+  "manual_overrides": [
+    {
+      "component": "J1",
+      "lock_position": true,
+      "preserve_rotation": true
+    },
+    {
+      "component": "X1",
+      "max_shift_mil": 80,
+      "preserve_rotation": true
+    }
   ]
 }

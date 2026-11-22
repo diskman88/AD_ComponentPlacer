@@ -107,11 +107,23 @@ def proximity_cost(data, poses):
     return total
 
 
+def manual_legal(data, i, pose):
+    rule = data.get('manual_rules',{}).get(i)
+    if not rule:
+        return True
+    x, y, angle = pose; ox, oy, oa = rule['original']
+    if rule['preserve_rotation'] and abs(angle-oa) > .001:
+        return False
+    return math.hypot(x-ox,y-oy) <= rule['max_shift'] + .001
+
+
 def legal(data, poses, i, pose):
     # Existing locked/anchor geometry is immutable.  It may legitimately
     # violate today's clearance rule in an already placed board; do not reject
     # the entire batch for that historical condition.  Movable parts still
     # undergo the full boundary and collision test below.
+    if not manual_legal(data,i,pose):
+        return False
     for rule in data.get('proximity_rules',[]):
         if rule['severity'] == 'hard' and rule['source'] == i and proximity_distance(data,pose,rule) > rule['max_distance'] + .001:
             return False

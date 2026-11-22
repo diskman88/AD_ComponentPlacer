@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 import time
 from solver import Cancelled, box_at, intersect, number, rotate, solve, validate, score
-from electrical_rules import load_rules
+from electrical_rules import load_manual_overrides, load_rules
 
 
 def read_lines(path):
@@ -134,6 +134,19 @@ def proximity_for_subset(data, ids, mapping, poses, anchors, rules):
     return compiled
 
 
+def manual_for_subset(data, mapping, overrides):
+    by_name = {part['name'].strip().upper(): i for i,part in enumerate(data['parts'])}
+    result = {}
+    for name, rule in overrides.items():
+        index = by_name.get(name)
+        if index is None:
+            raise ValueError('Manual override references missing component: '+name)
+        if index in mapping:
+            result[mapping[index]] = dict(original=data['parts'][index]['pose'],
+                                          preserve_rotation=rule['preserve_rotation'],max_shift=rule['max_shift'])
+    return result
+
+
 def _selection(data, indices, centers=None, sides=None):
     """Normalize/validate v0.4 per-class anchor and destination side choices."""
     if not indices or len(set(indices)) != len(indices): raise ValueError('Select at least one class without duplicates')
@@ -252,6 +265,7 @@ def plan_batch(data, indices, gap, per_class, cancel, progress=lambda *args: Non
     selected = {ci:(anchors_for_class,side) for ci,anchors_for_class,side in choices}
     final_layers = target_layers(data,indices,centers,sides)
     rules = load_rules(data['board'])
+    overrides = load_manual_overrides(data['board'])
     poses = [p['pose'] for p in data['parts']]; reports = []
     for order, ci in enumerate(indices):
         if cancel.is_set(): raise Cancelled()
@@ -261,6 +275,7 @@ def plan_batch(data, indices, gap, per_class, cancel, progress=lambda *args: Non
         parts = [copy.deepcopy(data['parts'][i]) for i in ids]
         for j, i in enumerate(ids):
             parts[j]['pose'] = poses[i]; parts[j]['fixed'] |= i in all_anchors
+            if overrides.get(data['parts'][i]['name'].strip().upper(),{}).get('lock_position',False): parts[j]['fixed'] = True
             parts[j]['top'] = final_layers[i]
         obstacles = [box_at(p,poses[i]) for i,p in enumerate(data['parts']) if i not in mapping]
         pads = [(mapping[i],net,x,y) for i,net,x,y in data['pads'] if i in mapping]
@@ -269,7 +284,8 @@ def plan_batch(data, indices, gap, per_class, cancel, progress=lambda *args: Non
                       # A locked center is a user-established anchor, so this
                       # class follows it without a Room/search-boundary limit.
                       unbounded=follow_locked_center,
-                      proximity_rules=proximity_for_subset(data,ids,mapping,poses,anchors_for_class,rules))
+                      proximity_rules=proximity_for_subset(data,ids,mapping,poses,anchors_for_class,rules),
+                      manual_rules=manual_for_subset(data,mapping,overrides))
         radius = initial_radius(parts,gap); start = time.monotonic(); result = None; attempts = 0
         while time.monotonic()-start < per_class and radius <= 20000 and attempts<8:
             attempts += 1; subset['radius'] = radius
@@ -293,6 +309,7 @@ def plan_batch(data, indices, gap, per_class, cancel, progress=lambda *args: Non
                             room='ClassPlacer_'+cls['name'],radius=radius,attempts=attempts,
                             room_enabled=not follow_locked_center,
                             follow_locked_center=follow_locked_center,
+                            manual_override_count=sum(1 for i in ids if data['parts'][i]['name'].strip().upper() in overrides),
                             before_hpwl=before,after_hpwl=after))
         progress(order+1,len(indices),cls['name'],radius,'finished')
     validate_batch(data,indices,poses,gap,centers,sides,final_layers)

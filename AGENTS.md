@@ -21,6 +21,10 @@ the PCB and applies that plan atomically in Altium Designer.
 - Treat electrical score first, total HPWL second, and visual alignment last.
   Cosmetic alignment must never regress electrical HPWL, total HPWL, clearance,
   or center compactness.
+- Treat ClassPlacer as a one-shot local pre-layout tool. After `APPLIED`, board
+  fitting, structure-aware moves, alignment, and layer decisions belong to the
+  human/AI post-layout stage; rerun only if Class membership, center selection,
+  or local electrical topology changes.
 - Keep source comments and user-facing documentation in Chinese where it helps
   the target users. Save Python sources as UTF-8.
 

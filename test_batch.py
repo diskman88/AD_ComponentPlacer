@@ -8,7 +8,7 @@ import time
 import unittest
 
 from batch import ai_handoff_specs,load,center_options,center_indices,class_info,initial_radius,proximity_for_subset,room_specs,select_classes,target_layers,plan_batch,validate_batch,publish
-from electrical_rules import load_rules
+from electrical_rules import load_manual_overrides, load_rules
 from solver import Cancelled,align_without_regression,box_at,intersect,legal,score,solve,validate,wire_scores
 from class_desktop import work
 from install import install
@@ -246,6 +246,18 @@ class BatchTests(unittest.TestCase):
             Path(td,'ClassPlacerRules.json').write_text(json.dumps(dict(schema='ad-component-placer-rules/v1',pin_proximity=[dict(source='C1',target='U1',source_net='A',target_net='A',severity='hard')],decoupling=[dict(capacitor='C1',ic='U1',power_net='A',ground_net='')])) ,encoding='utf-8')
             rules=load_rules(d['board'])
         self.assertEqual([rule['kind'] for rule in rules],['pin_proximity','decoupling'])
+
+    def test_manual_override_limits_motion_and_rotation(self):
+        d=fixture();parts=copy.deepcopy(d['parts'][:2]);parts[0]['fixed']=True
+        subset=dict(parts=parts,anchor=0,anchors=[0],gap=12.,radius=1000.,obstacles=[],pads=d['pads'][:2],
+                    manual_rules={1:dict(original=parts[1]['pose'],max_shift=80.,preserve_rotation=True)})
+        self.assertTrue(legal(subset,[parts[0]['pose'],(1660.,1000.,0.)],1,(1660.,1000.,0.)))
+        self.assertFalse(legal(subset,[parts[0]['pose'],(1700.,1000.,0.)],1,(1700.,1000.,0.)))
+        self.assertFalse(legal(subset,[parts[0]['pose'],(1600.,1000.,90.)],1,(1600.,1000.,90.)))
+        with tempfile.TemporaryDirectory() as td:
+            board=Path(td)/'test.PcbDoc'
+            Path(td,'ClassPlacerRules.json').write_text(json.dumps(dict(schema='ad-component-placer-rules/v1',manual_overrides=[dict(component='C1',max_shift_mil=80,preserve_rotation=True)])),encoding='utf-8')
+            self.assertEqual(load_manual_overrides(board)['C1']['max_shift'],80.)
 
     def test_locked_center_is_room_free_but_still_avoids_obstacles(self):
         d=fixture();d['parts'][0]['fixed']=True
